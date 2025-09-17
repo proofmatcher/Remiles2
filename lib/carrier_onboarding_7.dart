@@ -1,8 +1,21 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:majh/presentation/dashboard/pages/carrier_dashboard.dart';
+import 'package:majh/presentation/dashboard/pages/main_page.dart';
 
 class CarrierOnboarding7Screen extends StatelessWidget {
   const CarrierOnboarding7Screen({super.key});
+  PageRouteBuilder _createFadePageRoute(Widget page) {
+    return PageRouteBuilder(
+      pageBuilder: (context, animation, secondaryAnimation) => page,
+      transitionsBuilder: (context, animation, secondaryAnimation, child) {
+        return FadeTransition(
+          opacity: animation,
+          child: child,
+        );
+      },
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -157,6 +170,10 @@ class CarrierOnboarding7Screen extends StatelessWidget {
                 child: GestureDetector(
                   onTap: () {
                     // TODO: Add navigation to the next screen (e.g., home screen)
+                    Navigator.push(
+                      context,
+                      _createFadePageRoute( MainPage()),
+                    );
                   },
                   child: Container(
                     width: 110 * scale,
