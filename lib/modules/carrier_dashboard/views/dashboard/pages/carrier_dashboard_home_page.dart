@@ -453,12 +453,14 @@ class _CarrierDashboardHomeScreenState
                                 children: [
                                   Row(
                                     children: [
-                                      const Text(
-                                        'Payment Setup Required',
-                                        style: TextStyle(
-                                          fontWeight: FontWeight.bold,
-                                          fontSize: 14,
-                                          color: Color(0xFF166534),
+                                      Flexible(
+                                        child: const Text(
+                                          'Payment Setup Required',
+                                          style: TextStyle(
+                                            fontWeight: FontWeight.w600,
+                                            fontSize: 13,
+                                            color: Color(0xFF166534),
+                                          ),
                                         ),
                                       ),
                                       const SizedBox(width: 4),
