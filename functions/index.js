@@ -1930,6 +1930,394 @@ exports.getConnectAccountStatus = functions
     });
 
 /**
+ * Delete Stripe Connect account for carrier
+ *
+ * This function deletes a Stripe Connect Express account for a carrier.
+ * It should be called when a carrier deletes their account.
+ *
+ * NOTE: This permanently deletes the Stripe account. Any pending payments
+ * or transfers should be handled before calling this function.
+ */
+exports.deleteConnectAccount = functions
+    .region("northamerica-northeast1")
+    .https.onRequest(async (req, res) => {
+      // Set CORS headers
+      res.set("Access-Control-Allow-Origin", "*");
+      res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+      if (req.method === "OPTIONS") {
+        res.status(204).send("");
+        return;
+      }
+
+      if (req.method !== "POST") {
+        res.status(405).json({error: "Method not allowed"});
+        return;
+      }
+
+      // Get auth token
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        res.status(401).json({
+          error: {
+            status: "UNAUTHENTICATED",
+            message: "User must be authenticated",
+          },
+        });
+        return;
+      }
+
+      const idToken = authHeader.split("Bearer ")[1];
+
+      // Verify token
+      let decodedToken;
+      try {
+        decodedToken = await admin.auth().verifyIdToken(idToken);
+      } catch (error) {
+        res.status(401).json({
+          error: {
+            status: "UNAUTHENTICATED",
+            message: "Invalid authentication token",
+          },
+        });
+        return;
+      }
+
+      try {
+        const stripe = getStripe();
+        const userId = decodedToken.uid;
+
+        // Verify user is a carrier
+        const carrierDoc = await admin.firestore()
+            .collection("carriers")
+            .doc(userId)
+            .get();
+
+        if (!carrierDoc.exists) {
+          res.status(403).json({
+            error: {
+              status: "PERMISSION_DENIED",
+              message: "Only carriers can delete Connect accounts",
+            },
+          });
+          return;
+        }
+
+        const carrierData = carrierDoc.data();
+        const accountId = carrierData.stripeAccountId;
+
+        if (!accountId) {
+          res.status(200).json({
+            result: {
+              deleted: false,
+              message: "No Stripe Connect account found to delete",
+            },
+          });
+          return;
+        }
+
+        // Delete the Stripe Connect account
+        const deletedAccount = await stripe.accounts.del(accountId);
+
+        // Remove stripeAccountId from Firestore
+        await admin.firestore()
+            .collection("carriers")
+            .doc(userId)
+            .update({
+              stripeAccountId: admin.firestore.FieldValue.delete(),
+            });
+
+        console.log(`Stripe Connect account deleted: ${accountId}`);
+
+        res.status(200).json({
+          result: {
+            deleted: deletedAccount.deleted || false,
+            accountId: accountId,
+            message: "Stripe Connect account deleted successfully",
+          },
+        });
+      } catch (error) {
+        console.error("Error deleting Connect account:", error);
+
+        // Handle Stripe-specific errors
+        if (error.type === "StripeInvalidRequestError") {
+          // Account might already be deleted or not exist
+          if (error.code === "resource_missing") {
+            // Remove stripeAccountId from Firestore even if account
+            // doesn't exist
+            try {
+              await admin.firestore()
+                  .collection("carriers")
+                  .doc(decodedToken.uid)
+                  .update({
+                    stripeAccountId: admin.firestore.FieldValue.delete(),
+                  });
+            } catch (firestoreError) {
+              console.error("Error cleaning up Firestore:", firestoreError);
+            }
+
+            res.status(200).json({
+              result: {
+                deleted: false,
+                message: "Stripe account not found (may already be deleted)",
+              },
+            });
+            return;
+          }
+        }
+
+        res.status(500).json({
+          error: {
+            status: "INTERNAL",
+            message: error.message || "Failed to delete Connect account",
+          },
+        });
+      }
+    });
+
+/**
+ * Delete user account and all associated data
+ * This function:
+ * 1. Deletes all Firestore documents (user doc, loads, listings,
+ *    conversations, messages, etc.)
+ * 2. Deletes all storage files
+ * 3. Handles Stripe account deletion (for carriers)
+ * 4. Deletes Firebase Auth user
+ */
+exports.deleteUserAccount = functions
+    .region("northamerica-northeast1")
+    .https.onRequest(async (req, res) => {
+      // Set CORS headers
+      res.set("Access-Control-Allow-Origin", "*");
+      res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+      if (req.method === "OPTIONS") {
+        res.status(204).send("");
+        return;
+      }
+
+      if (req.method !== "POST") {
+        res.status(405).json({error: "Method not allowed"});
+        return;
+      }
+
+      // Get auth token
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        res.status(401).json({
+          error: {
+            status: "UNAUTHENTICATED",
+            message: "User must be authenticated",
+          },
+        });
+        return;
+      }
+
+      const idToken = authHeader.split("Bearer ")[1];
+
+      // Verify token
+      let decodedToken;
+      try {
+        decodedToken = await admin.auth().verifyIdToken(idToken);
+      } catch (error) {
+        res.status(401).json({
+          error: {
+            status: "UNAUTHENTICATED",
+            message: "Invalid authentication token",
+          },
+        });
+        return;
+      }
+
+      const userId = decodedToken.uid;
+      const {userRole} = req.body.data || req.body;
+
+      if (!userRole || !["shipper", "carrier"].includes(userRole)) {
+        res.status(400).json({
+          error: {
+            status: "INVALID_ARGUMENT",
+            message: "userRole must be 'shipper' or 'carrier'",
+          },
+        });
+        return;
+      }
+
+      try {
+        console.log(
+            `Starting account deletion for user: ${userId}, role: ${userRole}`);
+
+        // Step 1: Get Stripe account ID for carriers
+        let stripeAccountId = null;
+        if (userRole === "carrier") {
+          try {
+            const carrierDoc = await admin.firestore()
+                .collection("carriers")
+                .doc(userId)
+                .get();
+            if (carrierDoc.exists) {
+              const carrierData = carrierDoc.data();
+              stripeAccountId =
+                  (carrierData && carrierData.stripeAccountId) || null;
+            }
+          } catch (error) {
+            console.error("Error getting carrier Stripe account:", error);
+            // Continue with deletion even if we can't get Stripe account ID
+          }
+        }
+
+        // Step 2: Delete all Firestore data
+        const db = admin.firestore();
+        const batch = db.batch();
+
+        // Delete user document from shippers or carriers collection
+        if (userRole === "shipper") {
+          // Delete shipper document
+          const shipperRef = db.collection("shippers").doc(userId);
+          batch.delete(shipperRef);
+
+          // Delete all loads for this shipper
+          const loadsSnapshot = await db
+              .collection("shippers")
+              .doc(userId)
+              .collection("loads")
+              .get();
+          loadsSnapshot.docs.forEach((doc) => {
+            batch.delete(doc.ref);
+          });
+
+          // Delete all listings for this shipper
+          const listingsSnapshot = await db
+              .collection("listings")
+              .where("shipperUid", "==", userId)
+              .get();
+          listingsSnapshot.docs.forEach((doc) => {
+            batch.delete(doc.ref);
+          });
+        } else if (userRole === "carrier") {
+          // Delete carrier document
+          const carrierRef = db.collection("carriers").doc(userId);
+          batch.delete(carrierRef);
+
+          // Delete all bookings for this carrier
+          const bookingsSnapshot = await db
+              .collection("bookings")
+              .where("carrierId", "==", userId)
+              .get();
+          bookingsSnapshot.docs.forEach((doc) => {
+            batch.delete(doc.ref);
+          });
+
+          // Delete all offers for this carrier
+          const offersSnapshot = await db
+              .collection("offers")
+              .where("carrierId", "==", userId)
+              .get();
+          offersSnapshot.docs.forEach((doc) => {
+            batch.delete(doc.ref);
+          });
+        }
+
+        // Delete conversations where user is a participant
+        const conversationsSnapshot = await db
+            .collection("conversations")
+            .where("participants", "array-contains", userId)
+            .get();
+        conversationsSnapshot.docs.forEach((doc) => {
+          batch.delete(doc.ref);
+        });
+
+        // Delete messages sent by this user
+        const messagesSnapshot = await db
+            .collection("messages")
+            .where("senderId", "==", userId)
+            .get();
+        messagesSnapshot.docs.forEach((doc) => {
+          batch.delete(doc.ref);
+        });
+
+        // Delete reports filed by this user
+        const reportsSnapshot = await db
+            .collection("reports")
+            .where("reporterId", "==", userId)
+            .get();
+        reportsSnapshot.docs.forEach((doc) => {
+          batch.delete(doc.ref);
+        });
+
+        // Delete from users collection if exists
+        const userRef = db.collection("users").doc(userId);
+        const userDoc = await userRef.get();
+        if (userDoc.exists) {
+          batch.delete(userRef);
+        }
+
+        // Commit all Firestore deletions
+        await batch.commit();
+        console.log("Firestore data deleted successfully");
+
+        // Step 3: Delete all storage files
+        const bucket = admin.storage().bucket();
+        const prefix = userRole === "shipper" ?
+            `shippers/${userId}` :
+            `carriers/${userId}`;
+
+        try {
+          const [files] = await bucket.getFiles({prefix: prefix});
+          const deletePromises = files.map((file) =>
+            file.delete().catch((err) => {
+              console.error(`Error deleting file ${file.name}:`, err);
+              // Continue even if individual file deletion fails
+            }));
+          await Promise.all(deletePromises);
+          console.log("Storage files deleted successfully");
+        } catch (error) {
+          console.error("Error deleting storage files:", error);
+          // Continue with deletion even if storage deletion fails
+        }
+
+        // Step 4: Handle Stripe account deletion (for carriers)
+        if (stripeAccountId && userRole === "carrier") {
+          try {
+            const stripe = getStripe();
+            await stripe.accounts.del(stripeAccountId);
+            console.log(`Stripe Connect account deleted: ${stripeAccountId}`);
+          } catch (error) {
+            console.error("Error deleting Stripe Connect account:", error);
+            // Continue with account deletion even if Stripe deletion fails
+            // The account data is already deleted from Firestore
+          }
+        }
+
+        // Step 5: Delete Firebase Auth user (must be done last)
+        try {
+          await admin.auth().deleteUser(userId);
+          console.log("Firebase Auth user deleted successfully");
+        } catch (error) {
+          console.error("Error deleting Firebase Auth user:", error);
+          // If user is already deleted or deletion fails, that's okay
+          // All data is already deleted
+        }
+
+        res.status(200).json({
+          result: {
+            success: true,
+            message: "Account deleted successfully",
+          },
+        });
+      } catch (error) {
+        console.error("Error deleting user account:", error);
+        res.status(500).json({
+          error: {
+            status: "INTERNAL",
+            message: error.message || "Failed to delete user account",
+          },
+        });
+      }
+    });
+
+/**
  * Transfer payment to carrier
  *
  * This function handles payment transfers from shippers to carriers.

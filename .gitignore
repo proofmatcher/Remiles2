@@ -71,7 +71,6 @@ gen/
 
 # IDEs and editors
 .idea/
-.vscode/
 *.iml
 *.ipr
 *.iws
@@ -107,3 +106,5 @@ GoogleService-Info.plist
 
 # Coverage reports
 coverage/
+config.bat
+node_modules

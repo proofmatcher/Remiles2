@@ -11,6 +11,8 @@ import 'app_config.dart';
 import 'dart:io';
 import 'package:image_picker/image_picker.dart';
 import 'dart:async';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
 import '../models/user_model.dart';
 import '../models/shipper_model.dart';
 import '../models/carrier_model.dart';
@@ -1493,20 +1495,21 @@ class FirebaseService {
         'carriers/$carrierUid/documents/$documentType.jpg',
       );
 
-      UploadTask uploadTask;
-      if (kIsWeb) {
-        final xfile = imageFile as XFile;
-        final bytes = await xfile.readAsBytes();
-        uploadTask = ref.putData(
-          bytes,
-          SettableMetadata(contentType: 'image/jpeg'),
-        );
+      // Use putData on all platforms to avoid file path length issues
+      // that can cause "Message too long" errors
+      Uint8List bytes;
+      if (imageFile is XFile) {
+        // XFile works on both web and mobile, use it directly
+        bytes = await imageFile.readAsBytes();
       } else {
-        final file = imageFile is XFile
-            ? File(imageFile.path)
-            : imageFile as File;
-        uploadTask = ref.putFile(file);
+        // It's a File object (mobile only)
+        bytes = await (imageFile as File).readAsBytes();
       }
+
+      final uploadTask = ref.putData(
+        bytes,
+        SettableMetadata(contentType: 'image/jpeg'),
+      );
 
       final snapshot = await uploadTask;
       final downloadUrl = await snapshot.ref.getDownloadURL();
@@ -1591,9 +1594,13 @@ class FirebaseService {
         parameters: _convertParameters({
           'phone_number_length': phoneNumber.length.toString(),
           'has_country_code': phoneNumber.startsWith('+').toString(),
+          'platform': kIsWeb ? 'web' : 'mobile',
         }),
       );
 
+      // For web, Firebase automatically shows reCAPTCHA when verifyPhoneNumber is called
+      // The reCAPTCHA container in index.html allows for inline display if needed
+      // We use the same verifyPhoneNumber call for all platforms - Firebase handles reCAPTCHA automatically on web
       await _auth.verifyPhoneNumber(
         phoneNumber: phoneNumber,
         verificationCompleted: (PhoneAuthCredential credential) async {
@@ -5517,6 +5524,403 @@ class FirebaseService {
         e,
         StackTrace.current,
         reason: 'Failed to save academy playlist',
+      );
+      rethrow;
+    }
+  }
+
+  /// Delete user account and all associated data via Cloud Function
+  /// This method:
+  /// 1. Reauthenticates user with password (for email/password users)
+  /// 2. Calls Cloud Function to delete all data, storage, Stripe account, and Auth user
+  static Future<void> deleteAccount({
+    required String userId,
+    required UserRole userRole,
+    String? password, // Required for email/password users
+  }) async {
+    try {
+      await log('Starting account deletion for user: $userId');
+      await logEvent(
+        'account_deletion_started',
+        parameters: _convertParameters({
+          'user_role': userRole.toString().split('.').last,
+        }),
+      );
+
+      // Step 1: Reauthenticate with password (required for email/password users)
+      final user = _auth.currentUser;
+      if (user == null) {
+        throw Exception('User not authenticated');
+      }
+
+      // Check if user is email/password user
+      bool isEmailPasswordUser = false;
+      for (var provider in user.providerData) {
+        if (provider.providerId == 'password') {
+          isEmailPasswordUser = true;
+          break;
+        }
+      }
+
+      // Require password for email/password users
+      if (isEmailPasswordUser) {
+        if (password == null || password.trim().isEmpty) {
+          throw Exception('Password is required for email/password accounts');
+        }
+
+        if (user.email == null) {
+          throw Exception('User email not found');
+        }
+
+        try {
+          await reauthenticateUser(user.email!, password);
+          await log('Password reauthentication successful');
+        } on FirebaseAuthException catch (e) {
+          await logEvent(
+            'account_deletion_failed',
+            parameters: _convertParameters({
+              'reason': 'reauthentication_failed',
+              'error_code': e.code,
+              'error': e.message ?? e.toString(),
+            }),
+          );
+          
+          // Re-throw with user-friendly message
+          if (e.code == 'wrong-password') {
+            throw Exception('Incorrect password. Please try again.');
+          } else if (e.code == 'invalid-credential') {
+            throw Exception('Invalid password. Please try again.');
+          } else {
+            rethrow;
+          }
+        } catch (e) {
+          await logEvent(
+            'account_deletion_failed',
+            parameters: _convertParameters({
+              'reason': 'reauthentication_failed',
+              'error': e.toString(),
+            }),
+          );
+          rethrow;
+        }
+      } else {
+        // OAuth users don't need password, but log it
+        await log('OAuth user - skipping password reauthentication');
+      }
+
+      // Step 2: Get fresh auth token after reauthentication
+      final freshToken = await user.getIdToken(true);
+      if (freshToken == null || freshToken.isEmpty) {
+        throw Exception('Failed to get authentication token');
+      }
+
+      // Step 3: Call Cloud Function to delete account
+      const projectId = 're-miles-dfm';
+      const region = 'northamerica-northeast1';
+      final functionUrl = 'https://$region-$projectId.cloudfunctions.net/deleteUserAccount';
+
+      final response = await http.post(
+        Uri.parse(functionUrl),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $freshToken',
+        },
+        body: jsonEncode({
+          'data': {
+            'userRole': userRole == UserRole.shipper ? 'shipper' : 'carrier',
+          },
+        }),
+      ).timeout(
+        const Duration(seconds: 120),
+        onTimeout: () {
+          throw Exception('Account deletion timed out. Please try again.');
+        },
+      );
+
+      if (response.statusCode == 200) {
+        final responseData = jsonDecode(response.body);
+        if (responseData['result'] != null && responseData['result']['success'] == true) {
+          await log('Account deletion completed successfully via Cloud Function');
+          await logEvent(
+            'account_deletion_completed',
+            parameters: _convertParameters({
+              'user_role': userRole.toString().split('.').last,
+              'success': 'true',
+            }),
+          );
+        } else {
+          throw Exception(responseData['error']?['message'] ?? 'Account deletion failed');
+        }
+      } else {
+        final errorData = jsonDecode(response.body);
+        final errorMessage = errorData['error']?['message'] ?? 'Failed to delete account';
+        throw Exception(errorMessage);
+      }
+    } catch (e) {
+      await recordError(
+        e,
+        StackTrace.current,
+        reason: 'Failed to delete user account',
+      );
+      await logEvent(
+        'account_deletion_failed',
+        parameters: _convertParameters({
+          'user_role': userRole.toString().split('.').last,
+          'error': e.toString(),
+        }),
+      );
+      rethrow;
+    }
+  }
+
+  /// Delete all Firestore data associated with a user
+  static Future<void> _deleteUserFirestoreData(
+    String userId,
+    UserRole userRole,
+  ) async {
+    try {
+      // Delete user document from shippers or carriers collection
+      if (userRole == UserRole.shipper) {
+        // Delete shipper document
+        await shippers.doc(userId).delete();
+
+        // Delete all loads for this shipper
+        final loadsSnapshot = await _firestore
+            .collection('shippers')
+            .doc(userId)
+            .collection('loads')
+            .get();
+        for (var doc in loadsSnapshot.docs) {
+          await doc.reference.delete();
+        }
+
+        // Delete all listings for this shipper
+        final listingsSnapshot = await listings
+            .where('shipperUid', isEqualTo: userId)
+            .get();
+        for (var doc in listingsSnapshot.docs) {
+          await deleteProductListing(doc.id);
+        }
+      } else if (userRole == UserRole.carrier) {
+        // Delete carrier document
+        await carriers.doc(userId).delete();
+
+        // Delete all bookings for this carrier
+        final bookingsSnapshot = await bookings
+            .where('carrierId', isEqualTo: userId)
+            .get();
+        for (var doc in bookingsSnapshot.docs) {
+          await doc.reference.delete();
+        }
+
+        // Delete all offers for this carrier
+        final offersSnapshot = await offers
+            .where('carrierId', isEqualTo: userId)
+            .get();
+        for (var doc in offersSnapshot.docs) {
+          await doc.reference.delete();
+        }
+      }
+
+      // Delete conversations where user is a participant
+      final conversationsSnapshot = await conversations
+          .where('participants', arrayContains: userId)
+          .get();
+      for (var doc in conversationsSnapshot.docs) {
+        await doc.reference.delete();
+      }
+
+      // Delete messages sent by this user
+      final messagesSnapshot = await messages
+          .where('senderId', isEqualTo: userId)
+          .get();
+      for (var doc in messagesSnapshot.docs) {
+        await doc.reference.delete();
+      }
+
+      // Delete reports filed by this user
+      final reportsSnapshot = await reports
+          .where('reporterId', isEqualTo: userId)
+          .get();
+      for (var doc in reportsSnapshot.docs) {
+        await doc.reference.delete();
+      }
+
+      // Delete from users collection if exists
+      try {
+        await users.doc(userId).delete();
+      } catch (e) {
+        // User might not exist in users collection, that's okay
+      }
+    } catch (e) {
+      await recordError(
+        e,
+        StackTrace.current,
+        reason: 'Failed to delete user Firestore data',
+      );
+      rethrow;
+    }
+  }
+
+  /// Delete all storage files associated with a user
+  static Future<void> _deleteUserStorageFiles(
+    String userId,
+    UserRole userRole,
+  ) async {
+    try {
+      final prefix = userRole == UserRole.shipper ? 'shippers' : 'carriers';
+      
+      // Delete user's storage folder
+      try {
+        final userFolderRef = _storage.ref().child('$prefix/$userId');
+        final listResult = await userFolderRef.listAll();
+        
+        // Delete all files in the folder
+        for (var item in listResult.items) {
+          try {
+            await item.delete();
+          } catch (e) {
+            await recordError(
+              e,
+              StackTrace.current,
+              reason: 'Failed to delete storage file: ${item.fullPath}',
+            );
+          }
+        }
+
+        // Delete subfolders (loads, listings, etc.)
+        for (var prefix in listResult.prefixes) {
+          try {
+            final subfolderList = await prefix.listAll();
+            for (var item in subfolderList.items) {
+              try {
+                await item.delete();
+              } catch (e) {
+                await recordError(
+                  e,
+                  StackTrace.current,
+                  reason: 'Failed to delete storage file: ${item.fullPath}',
+                );
+              }
+            }
+          } catch (e) {
+            // Subfolder might not exist, that's okay
+          }
+        }
+      } catch (e) {
+        // Folder might not exist, that's okay
+        if (AppConfig.enableDebugLogging) {
+          print('Storage folder not found or already deleted: $prefix/$userId');
+        }
+      }
+
+      // Delete profile image if exists
+      try {
+        final profileImageRef = _storage.ref().child('$prefix/$userId/profile_image.jpg');
+        await profileImageRef.delete();
+      } catch (e) {
+        // Profile image might not exist, that's okay
+      }
+    } catch (e) {
+      await recordError(
+        e,
+        StackTrace.current,
+        reason: 'Failed to delete user storage files',
+      );
+      // Don't rethrow - storage deletion failures shouldn't block account deletion
+    }
+  }
+
+  /// Delete Stripe Connect account for carrier
+  static Future<void> _deleteStripeConnectAccount(String accountId) async {
+    try {
+      final currentUser = _auth.currentUser;
+      if (currentUser == null) {
+        throw Exception('User must be logged in');
+      }
+
+      final freshToken = await currentUser.getIdToken(true);
+      if (freshToken == null) {
+        throw Exception('Failed to obtain authentication token');
+      }
+
+      await log('Deleting Stripe Connect account: $accountId');
+      await logEvent(
+        'stripe_account_deletion_started',
+        parameters: _convertParameters({
+          'account_id': accountId,
+        }),
+      );
+
+      const projectId = 're-miles-dfm';
+      const region = 'northamerica-northeast1';
+      final functionUrl =
+          'https://$region-$projectId.cloudfunctions.net/deleteConnectAccount';
+
+      final response = await http
+          .post(
+            Uri.parse(functionUrl),
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer $freshToken',
+            },
+            body: jsonEncode({'data': {}}),
+          )
+          .timeout(
+            const Duration(seconds: 30),
+            onTimeout: () {
+              throw Exception('Delete Stripe account timed out');
+            },
+          );
+
+      if (response.statusCode != 200) {
+        final errorBody = response.body;
+        try {
+          final errorJson = jsonDecode(errorBody);
+          final error = errorJson['error'] as Map<String, dynamic>?;
+          final errorMessage = error?['message'] as String?;
+          throw Exception(errorMessage ?? 'Failed to delete Stripe Connect account');
+        } catch (parseError) {
+          throw Exception(
+            'Failed to delete Stripe Connect account: ${response.statusCode}',
+          );
+        }
+      }
+
+      final responseJson = jsonDecode(response.body);
+      final result = responseJson['result'] as Map<String, dynamic>?;
+      final deleted = result?['deleted'] as bool? ?? false;
+
+      if (deleted) {
+        await log('Stripe Connect account deleted successfully: $accountId');
+        await logEvent(
+          'stripe_account_deletion_success',
+          parameters: _convertParameters({
+            'account_id': accountId,
+          }),
+        );
+      } else {
+        await log('Stripe Connect account deletion completed (may not have existed): $accountId');
+        await logEvent(
+          'stripe_account_deletion_completed',
+          parameters: _convertParameters({
+            'account_id': accountId,
+            'deleted': 'false',
+          }),
+        );
+      }
+    } catch (e) {
+      await recordError(
+        e,
+        StackTrace.current,
+        reason: 'Failed to delete Stripe Connect account',
+      );
+      await logEvent(
+        'stripe_account_deletion_failed',
+        parameters: _convertParameters({
+          'account_id': accountId,
+          'error': e.toString(),
+        }),
       );
       rethrow;
     }

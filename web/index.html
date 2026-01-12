@@ -35,6 +35,18 @@
   <title>Remiles</title>
   <link rel="manifest" href="manifest.json">
 
+  <!-- Hide reCAPTCHA badge -->
+  <style>
+    .grecaptcha-badge { 
+      visibility: hidden !important; 
+      opacity: 0 !important;
+      display: none !important;
+    }
+    #recaptcha-container {
+      display: none;
+    }
+  </style>
+
   <!-- This script adds the flutter initialization JS code -->
   <script src="flutter.js" defer></script>
   <script src="https://js.stripe.com/v3/"></script>
@@ -42,6 +54,8 @@
 </head>
 
 <body>
+  <!-- reCAPTCHA container for phone authentication -->
+  <div id="recaptcha-container"></div>
   <script>
     window.addEventListener('load', function (ev) {
       // Download main.dart.js
