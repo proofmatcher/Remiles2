@@ -1640,12 +1640,14 @@ class _ShipperDashboardHomePageState extends State<ShipperDashboardHomePage> {
                                   children: [
                                     Row(
                                       children: [
-                                        const Text(
-                                          'Payment Method Required',
-                                          style: TextStyle(
-                                            fontWeight: FontWeight.bold,
-                                            fontSize: 14,
-                                            color: Color(0xFF856404),
+                                        Flexible(
+                                          child: const Text(
+                                            'Payment Method Required',
+                                            style: TextStyle(
+                                              fontWeight: FontWeight.w600,
+                                              fontSize: 13,
+                                              color: Color(0xFF856404),
+                                            ),
                                           ),
                                         ),
                                         const SizedBox(width: 4),
