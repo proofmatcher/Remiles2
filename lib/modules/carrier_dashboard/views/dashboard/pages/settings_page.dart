@@ -1,9 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:firebase_auth/firebase_auth.dart' hide AuthProvider;
+import 'package:flutter/foundation.dart' show kIsWeb;
+import '../../../../../../core/html_stub.dart' as html if (dart.library.html) 'dart:html';
 import '../../../../../providers/auth_provider.dart';
 import '../../../../../providers/app_state_provider.dart';
 import '../../../../../core/firebase_service.dart';
+import '../../../../../core/app_config.dart';
+import '../../../../../core/auth_wrapper.dart';
 import '../../../../../models/user_model.dart';
 
 class SettingsPage extends StatefulWidget {
@@ -31,6 +35,14 @@ class _SettingsPageState extends State<SettingsPage> {
   bool _isOtpSent = false;
   bool _isVerifyingOtp = false;
 
+  // Delete account state
+  final _deletePasswordController = TextEditingController();
+  final _deleteOtpController = TextEditingController();
+  String? _deleteVerificationId;
+  bool _isDeleteOtpSent = false;
+  bool _isDeletingAccount = false;
+  bool _showDeleteAccountSection = false;
+
   @override
   void initState() {
     super.initState();
@@ -50,6 +62,8 @@ class _SettingsPageState extends State<SettingsPage> {
     _confirmPasswordController.dispose();
     _phoneController.dispose();
     _otpController.dispose();
+    _deletePasswordController.dispose();
+    _deleteOtpController.dispose();
     super.dispose();
   }
 
@@ -67,6 +81,7 @@ class _SettingsPageState extends State<SettingsPage> {
       // Google provider: "google.com"
       // Apple provider: "apple.com"
       // Email/Password provider: "password"
+      print('providerId: $providerId');
       if (providerId == 'google.com' || providerId == 'apple.com') {
         return true;
       }
@@ -264,6 +279,20 @@ class _SettingsPageState extends State<SettingsPage> {
       appStateProvider.showSuccess();
 
       if (mounted) {
+        // Clean up reCAPTCHA container on web after OTP is sent
+        if (kIsWeb) {
+          try {
+            Future.delayed(const Duration(seconds: 2), () {
+              final container = html.window.document.getElementById('recaptcha-container');
+              if (container != null) {
+                container.style.display = 'none';
+              }
+            });
+          } catch (e) {
+            // Ignore errors in cleanup
+          }
+        }
+
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text('OTP sent successfully. Please check your phone.'),
@@ -421,6 +450,19 @@ class _SettingsPageState extends State<SettingsPage> {
       appStateProvider.showSuccess();
 
       if (mounted) {
+        // Clean up reCAPTCHA container on web after verification
+        if (kIsWeb) {
+          try {
+            final container = html.window.document.getElementById('recaptcha-container');
+            if (container != null) {
+              container.style.display = 'none';
+              container.innerHtml = '';
+            }
+          } catch (e) {
+            // Ignore errors in cleanup
+          }
+        }
+
         // Clear form
         _phoneController.clear();
         _otpController.clear();
@@ -494,6 +536,389 @@ class _SettingsPageState extends State<SettingsPage> {
       if (mounted) {
         setState(() {
           _isVerifyingOtp = false;
+        });
+      }
+    }
+  }
+
+  // Delete account methods
+  Future<void> _sendDeleteAccountOTP() async {
+    final carrier = context.read<AuthProvider>().carrierUser;
+    if (carrier?.phoneNumber == null || carrier!.phoneNumber!.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Phone number is required for account deletion'),
+          backgroundColor: Colors.red,
+          duration: Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
+
+    // Validate password FIRST for email/password users
+    if (!_isOAuthUser()) {
+      if (_deletePasswordController.text.trim().isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Please enter your password first'),
+            backgroundColor: Colors.red,
+            duration: Duration(seconds: 2),
+          ),
+        );
+        return;
+      }
+
+      // Verify password before sending OTP
+      try {
+        final authProvider = context.read<AuthProvider>();
+        final firebaseUser = authProvider.firebaseUser;
+        if (firebaseUser?.email == null) {
+          throw Exception('User email not found');
+        }
+
+        await FirebaseService.reauthenticateUser(
+          firebaseUser!.email!,
+          _deletePasswordController.text.trim(),
+        );
+      } on FirebaseAuthException catch (e) {
+        String errorMessage;
+        switch (e.code) {
+          case 'wrong-password':
+            errorMessage = 'Incorrect password. Please try again.';
+            break;
+          case 'invalid-credential':
+            errorMessage = 'Invalid password. Please try again.';
+            break;
+          case 'user-mismatch':
+            errorMessage = 'User mismatch. Please try again.';
+            break;
+          case 'user-not-found':
+            errorMessage = 'User not found.';
+            break;
+          default:
+            errorMessage = 'Password verification failed: ${e.message ?? e.code}';
+        }
+        
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(errorMessage),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+        return;
+      } catch (e) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Password verification failed: ${e.toString()}'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+        return;
+      }
+    }
+
+    setState(() {
+      _isPhoneVerificationLoading = true;
+    });
+
+    try {
+      final appStateProvider = context.read<AppStateProvider>();
+      appStateProvider.showLoadingWithMessage('Sending OTP...');
+
+      String phoneNumber = carrier.phoneNumber!.trim();
+      if (!phoneNumber.startsWith('+')) {
+        phoneNumber = '+$phoneNumber';
+      }
+
+      final verificationId = await FirebaseService.sendPhoneOTP(
+        phoneNumber,
+        onCodeSent: (String verificationId) {
+          if (mounted) {
+            setState(() {
+              _deleteVerificationId = verificationId;
+              _isDeleteOtpSent = true;
+            });
+          }
+        },
+      );
+
+      if (!_isDeleteOtpSent) {
+        setState(() {
+          _deleteVerificationId = verificationId;
+          _isDeleteOtpSent = true;
+        });
+      }
+
+      appStateProvider.showSuccess();
+
+      if (mounted) {
+        // Clean up reCAPTCHA container on web after OTP is sent
+        if (kIsWeb) {
+          try {
+            Future.delayed(const Duration(seconds: 2), () {
+              final container = html.window.document.getElementById('recaptcha-container');
+              if (container != null) {
+                container.style.display = 'none';
+              }
+            });
+          } catch (e) {
+            // Ignore errors in cleanup
+          }
+        }
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('OTP sent successfully. Please check your phone.'),
+            backgroundColor: Color(0xFF4B744F),
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
+    } catch (e) {
+      final appStateProvider = context.read<AppStateProvider>();
+      appStateProvider.showError('Failed to send OTP. Please try again.');
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error: ${e.toString()}'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isPhoneVerificationLoading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _deleteAccount() async {
+    if (!_isDeleteOtpSent || _deleteVerificationId == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Please verify your phone number first'),
+          backgroundColor: Colors.red,
+          duration: Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
+
+    if (_deleteOtpController.text.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Please enter the OTP code'),
+          backgroundColor: Colors.red,
+          duration: Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
+
+    // Validate password for email/password users
+    if (!_isOAuthUser()) {
+      if (_deletePasswordController.text.trim().isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Password is required for account deletion'),
+            backgroundColor: Colors.red,
+            duration: Duration(seconds: 2),
+          ),
+        );
+        return;
+      }
+    }
+
+    // Show confirmation dialog
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete Account'),
+        content: const Text(
+          'Are you sure you want to delete your account? This action cannot be undone. All your data, bookings, offers, messages, and Stripe account will be permanently deleted.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) {
+      return;
+    }
+
+    setState(() {
+      _isDeletingAccount = true;
+    });
+
+    try {
+      final authProvider = context.read<AuthProvider>();
+      final appStateProvider = context.read<AppStateProvider>();
+      final carrier = authProvider.carrierUser;
+
+      if (carrier == null) {
+        throw Exception('Carrier not found');
+      }
+
+      appStateProvider.showLoadingWithMessage('Deleting account...');
+
+      // Verify OTP first
+      String phoneNumber = carrier.phoneNumber!.trim();
+      if (!phoneNumber.startsWith('+')) {
+        phoneNumber = '+$phoneNumber';
+      }
+
+      await FirebaseService.verifyPhoneOTP(
+        verificationId: _deleteVerificationId!,
+        smsCode: _deleteOtpController.text.trim(),
+        phoneNumber: phoneNumber,
+        userUid: carrier.uid,
+        userRole: UserRole.carrier,
+      );
+
+      // Delete account with timeout to prevent hanging
+      await FirebaseService.deleteAccount(
+        userId: carrier.uid,
+        userRole: UserRole.carrier,
+        password: _isOAuthUser() ? null : _deletePasswordController.text.trim(),
+      ).timeout(
+        const Duration(seconds: 60),
+        onTimeout: () {
+          throw Exception('Account deletion timed out. Please try again.');
+        },
+      );
+
+      // Clear loading state immediately after successful deletion
+      appStateProvider.clearLoading();
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Account deleted successfully'),
+            backgroundColor: Color(0xFF4B744F),
+            duration: Duration(seconds: 2),
+          ),
+        );
+        
+        // Clear form and state
+        _deletePasswordController.clear();
+        _deleteOtpController.clear();
+        setState(() {
+          _deleteVerificationId = null;
+          _isDeleteOtpSent = false;
+          _isDeletingAccount = false;
+        });
+
+        // Clean up reCAPTCHA container on web
+        if (kIsWeb) {
+          try {
+            // Hide reCAPTCHA container
+            final container = html.window.document.getElementById('recaptcha-container');
+            if (container != null) {
+              container.style.display = 'none';
+              container.innerHtml = '';
+            }
+          } catch (e) {
+            // Ignore errors in cleanup
+            print('Error cleaning up reCAPTCHA: $e');
+          }
+        }
+
+        // Small delay to ensure UI updates
+        await Future.delayed(const Duration(milliseconds: 500));
+        
+        // Sign out and navigate to welcome screen
+        // Wrap in try-catch to handle any errors during sign out
+        try {
+          await authProvider.signOut();
+        } catch (e) {
+          // User might already be deleted, ignore sign out errors
+          if (AppConfig.enableDebugLogging) {
+            print('Error during sign out after account deletion: $e');
+          }
+        }
+        
+        // Navigate directly to AuthWrapper which will show welcome screen
+        if (mounted) {
+          Navigator.of(context).pushAndRemoveUntil(
+            MaterialPageRoute(builder: (_) => const AuthWrapper()),
+            (route) => false,
+          );
+        }
+      }
+    } on FirebaseAuthException catch (e) {
+      final appStateProvider = context.read<AppStateProvider>();
+      String errorMessage;
+      
+      switch (e.code) {
+        case 'invalid-verification-code':
+          errorMessage = 'Invalid OTP code. Please try again.';
+          break;
+        case 'session-expired':
+          errorMessage = 'OTP session expired. Please request a new code.';
+          break;
+        case 'wrong-password':
+          errorMessage = 'Incorrect password. Please try again.';
+          break;
+        default:
+          errorMessage = 'Failed to delete account: ${e.message}';
+      }
+      
+      appStateProvider.clearLoading();
+      appStateProvider.showError(errorMessage);
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(errorMessage),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    } catch (e) {
+      final appStateProvider = context.read<AppStateProvider>();
+      appStateProvider.clearLoading();
+      appStateProvider.showError('Failed to delete account. Please try again.');
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error: ${e.toString()}'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    } finally {
+      // Always clear loading state, even if there was an error
+      if (mounted) {
+        try {
+          final appStateProvider = context.read<AppStateProvider>();
+          appStateProvider.clearLoading();
+        } catch (e) {
+          // Ignore errors when clearing loading
+          if (AppConfig.enableDebugLogging) {
+            print('Error clearing loading state: $e');
+          }
+        }
+        
+        setState(() {
+          _isDeletingAccount = false;
         });
       }
     }
@@ -1076,6 +1501,218 @@ class _SettingsPageState extends State<SettingsPage> {
                           ],
                         ),
                       ),
+                    ],
+
+                    // Delete Account Section
+                    const SizedBox(height: 40),
+                    const Divider(),
+                    const SizedBox(height: 20),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            'Delete Account',
+                            style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.red.shade700,
+                              fontFamily: 'Roboto',
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          icon: Icon(
+                            _showDeleteAccountSection
+                                ? Icons.expand_less
+                                : Icons.expand_more,
+                            color: Colors.red.shade700,
+                          ),
+                          onPressed: () {
+                            setState(() {
+                              _showDeleteAccountSection = !_showDeleteAccountSection;
+                            });
+                          },
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    if (_showDeleteAccountSection) ...[
+                      Container(
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          color: Colors.red.shade50,
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(color: Colors.red.shade200),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Icon(Icons.warning, color: Colors.red.shade700),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: Text(
+                                    'Deleting your account will permanently remove all your data, including bookings, offers, messages, payment information, and your Stripe Connect account. This action cannot be undone.',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      color: Colors.red.shade900,
+                                      fontFamily: 'Roboto',
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 20),
+
+                      // Password field (only for email/password users)
+                      if (!_isOAuthUser()) ...[
+                        TextFormField(
+                          controller: _deletePasswordController,
+                          obscureText: true,
+                          decoration: InputDecoration(
+                            labelText: 'Enter Password',
+                            labelStyle: const TextStyle(
+                              color: Color(0xFF186230),
+                              fontFamily: 'Roboto',
+                            ),
+                            prefixIcon: const Icon(Icons.lock, color: Color(0xFF186230)),
+                            enabledBorder: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(10),
+                              borderSide: const BorderSide(color: Colors.red, width: 2),
+                            ),
+                            focusedBorder: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(10),
+                              borderSide: const BorderSide(color: Colors.red, width: 2),
+                            ),
+                            errorBorder: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(10),
+                              borderSide: const BorderSide(color: Colors.red, width: 2),
+                            ),
+                            focusedErrorBorder: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(10),
+                              borderSide: const BorderSide(color: Colors.red, width: 2),
+                            ),
+                            filled: true,
+                            fillColor: Colors.white,
+                          ),
+                          validator: (value) {
+                            if (value == null || value.trim().isEmpty) {
+                              return 'Password is required';
+                            }
+                            return null;
+                          },
+                        ),
+                        const SizedBox(height: 16),
+                      ],
+
+                      // OTP section
+                      if (!_isDeleteOtpSent) ...[
+                        SizedBox(
+                          width: double.infinity,
+                          height: 50,
+                          child: ElevatedButton(
+                            onPressed: _isPhoneVerificationLoading
+                                ? null
+                                : _sendDeleteAccountOTP,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.red.shade600,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              elevation: 4,
+                            ),
+                            child: _isPhoneVerificationLoading
+                                ? const SizedBox(
+                                    width: 20,
+                                    height: 20,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                                    ),
+                                  )
+                                : const Text(
+                                    'Send OTP to Phone',
+                                    style: TextStyle(
+                                      fontFamily: 'Roboto',
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 16,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                          ),
+                        ),
+                      ] else ...[
+                        TextFormField(
+                          controller: _deleteOtpController,
+                          keyboardType: TextInputType.number,
+                          maxLength: 6,
+                          decoration: InputDecoration(
+                            labelText: 'Enter OTP',
+                            hintText: '123456',
+                            labelStyle: const TextStyle(
+                              color: Color(0xFF186230),
+                              fontFamily: 'Roboto',
+                            ),
+                            prefixIcon: const Icon(Icons.lock_outline, color: Color(0xFF186230)),
+                            enabledBorder: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(10),
+                              borderSide: const BorderSide(color: Colors.red, width: 2),
+                            ),
+                            focusedBorder: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(10),
+                              borderSide: const BorderSide(color: Colors.red, width: 2),
+                            ),
+                            errorBorder: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(10),
+                              borderSide: const BorderSide(color: Colors.red, width: 2),
+                            ),
+                            focusedErrorBorder: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(10),
+                              borderSide: const BorderSide(color: Colors.red, width: 2),
+                            ),
+                            filled: true,
+                            fillColor: Colors.white,
+                            counterText: '',
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        SizedBox(
+                          width: double.infinity,
+                          height: 50,
+                          child: ElevatedButton(
+                            onPressed: _isDeletingAccount ? null : _deleteAccount,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.red.shade700,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              elevation: 4,
+                            ),
+                            child: _isDeletingAccount
+                                ? const SizedBox(
+                                    width: 20,
+                                    height: 20,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                                    ),
+                                  )
+                                : const Text(
+                                    'Delete Account',
+                                    style: TextStyle(
+                                      fontFamily: 'Roboto',
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 16,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                          ),
+                        ),
+                      ],
                     ],
                   ],
                 ),

@@ -66,6 +66,18 @@ class _ShipperSignUpScreenState extends State<ShipperSignUpScreen> {
   ];
 
   @override
+  void initState() {
+    super.initState();
+    // Clear any previous error messages when navigating to signup page
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final authProvider = context.read<AuthProvider>();
+      final appStateProvider = context.read<AppStateProvider>();
+      authProvider.clearError();
+      appStateProvider.clearError();
+    });
+  }
+
+  @override
   void dispose() {
     _companyNameController.dispose();
     _emailController.dispose();
